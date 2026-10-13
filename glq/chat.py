@@ -263,6 +263,27 @@ def _server_port(base_url: str, default: int = 8000) -> int:
     return urlparse(base_url).port or default
 
 
+def _ram_bytes():
+    """Total host RAM, or None if it cannot be read.
+
+    The supervisor needs this because offloaded expert weights are **pinned**: pinned pages
+    cannot be swapped out, so planning more than the host can hold does not run slowly, it
+    fails to allocate. Without it `_PINNED_RAM_FRACTION` cannot bind — measured on a 121 GiB
+    box, `glq-code` planned `--cpu-offload-gb 42` for Flash-Next, which beside the 23.84 GiB
+    PLE table is 66 GiB of pinned memory and impossible on the 32-64 GiB a consumer has.
+
+    Same never-block contract as `_vram_bytes`: a failure means the caps simply do not bind,
+    which is the behaviour that existed before this was wired in.
+
+    Shared by glq-chat and glq-code, for the same reason `sizing_weights_bytes` is.
+    """
+    try:
+        from glq.installer.hardware import ram_bytes
+        return ram_bytes()
+    except Exception:                                       # noqa: BLE001 - never block
+        return None
+
+
 def _vram_bytes():
     """Total VRAM, or None where nvidia-smi cannot answer."""
     try:
@@ -272,15 +293,41 @@ def _vram_bytes():
         return None
 
 
+def _sizing_fetch(model: str):
+    """Where the sizing lookups should read from: a local checkpoint directory, or the Hub.
+
+    `--model` takes either a repo id or a path, and the three lookups below were HTTP-only.
+    A path interpolates into the URL, so it could never resolve — and because all three
+    swallow failure, the window, PLE offload, expert offload and the expert arena collapsed
+    together in silence. Measured on an L4: 16384 instead of 131072 tokens, and 6.4 instead
+    of 15.2 tok/s with no message explaining either.
+
+    A token does not fix that half; no authorization makes the URL valid. What does is
+    noticing the bytes are already on disk — `config.json` sits beside the weights in any
+    cached snapshot, so for a model that is present this never needed the network at all.
+    """
+    try:
+        if model and Path(model).is_dir():
+            from glq.installer.discovery import local_fetcher
+            return local_fetcher(model)
+    except OSError:                                         # unreadable path, or not a path
+        pass
+    # Read the attribute at call time, not as a default argument: every function here binds
+    # `fetch=_fetch_json` at import, which is why patching the module attribute cannot reach
+    # them. (The same default-argument trap hides `VllmSupervisor`'s `spawn` seam.)
+    from glq.installer import discovery
+    return discovery._fetch_json
+
+
 def _model_max_len(repo_id: str):
     """The model's declared context maximum, or None — sizes the auto window's clamp.
 
-    Same never-block contract as _checkpoint_bytes: one small HTTP call whose failure
-    must not stop the chat from starting at the conservative floor.
+    Same never-block contract as _checkpoint_bytes: one small lookup whose failure must not
+    stop the chat from starting at the conservative floor.
     """
     try:
         from glq.installer.discovery import model_max_len
-        return model_max_len(repo_id) or None
+        return model_max_len(repo_id, fetch=_sizing_fetch(repo_id)) or None
     except Exception:                                       # noqa: BLE001 - offline, 404, …
         return None
 
@@ -295,7 +342,7 @@ def _checkpoint_bytes(repo_id: str):
     """
     try:
         from glq.installer.discovery import repo_size_bytes
-        return repo_size_bytes(repo_id) or None
+        return repo_size_bytes(repo_id, fetch=_sizing_fetch(repo_id)) or None
     except Exception:                                       # noqa: BLE001 - offline, 404, …
         return None
 
@@ -316,11 +363,98 @@ def checkpoint_offload_bytes(repo_id: str) -> tuple[int, int, int]:
     if not repo_id:
         return 0, 0, 0
     try:
-        from glq.installer.discovery import _fetch_json, offload_bytes
-        return offload_bytes(
-            _fetch_json(f"https://huggingface.co/{repo_id}/resolve/main/config.json"))
+        from glq.installer.discovery import offload_bytes
+        return offload_bytes(_sizing_fetch(repo_id)(
+            f"https://huggingface.co/{repo_id}/resolve/main/config.json"))
     except Exception:                                       # noqa: BLE001 - offline, 404, …
         return 0, 0, 0
+
+
+def checkpoint_mtp(repo_id: str) -> tuple[int, bool, int]:
+    """``(mtp_layers, head_is_quantized, decoder_layers)`` for this checkpoint, zeros if
+    unknown — what the planner needs to budget for speculative decoding.
+
+    `mtp_layers` drives whether `--mtp` is offerable at all. **Test the VALUE, not the key:**
+    `mtp`, `mtp_num_hidden_layers` and `mtp_use_dedicated_embeddings` are all present on
+    Flash-Next builds that have no usable head, with `null` values (measured on
+    `...-3bpw-ple4`, 2026-10-13).
+
+    `head_is_quantized` is whether `layer_bpw` carries MTP entries — 1,545 of them on
+    `...-ple4-3mtp`, 0 on `...-ple4`, whose head is bf16 and therefore costs the whole of
+    `nontext_bytes` (4.86 GiB) to load. Matched on dotted SEGMENTS, following the warning on
+    `quantize_model._is_nontext`: `model.layers.0.mtpool.weight` contains "mtp" and is an
+    ordinary text weight.
+
+    `decoder_layers` is what makes the MTP block's expert bytes derivable rather than guessed:
+    `_offloadable_bytes` drops that layer from every total, so the planner reconstructs it as
+    one layer's share of `expert_offload_bytes`.
+
+    Same never-block contract as `checkpoint_offload_bytes`, and shared by glq-chat and
+    glq-code so the two cannot drift apart on it.
+    """
+    if not repo_id:
+        return 0, False, 0
+    try:
+        cfg = _sizing_fetch(repo_id)(
+            f"https://huggingface.co/{repo_id}/resolve/main/config.json")
+        text = cfg.get("text_config") or {}
+
+        def _get(key):
+            return cfg.get(key) or text.get(key)
+
+        mtp = _get("mtp_num_hidden_layers") or _get("num_nextn_predict_layers")
+        if not mtp:
+            block = _get("mtp")
+            if isinstance(block, dict):
+                mtp = block.get("num_hidden_layers") or 1
+        layers = int(_get("num_hidden_layers") or 0)
+        lb = (cfg.get("quantization_config") or {}).get("layer_bpw") or {}
+        quantized = any(k.split(".")[0] == "mtp" for k in lb)
+        return int(mtp or 0), quantized, layers
+    except Exception:                                       # noqa: BLE001 - offline, 404, …
+        return 0, False, 0
+
+
+def resolve_mtp_tokens(requested, mtp_layers: int, head_is_quantized: bool):
+    """Draft tokens to speculate with, or a message explaining the refusal.
+
+    Returns ``(tokens, error)`` — exactly one of them meaningful.
+
+    **The default is OFF.** Speculation is opt-in via `--mtp N`, for two reasons measured
+    rather than assumed:
+
+    * It changes output. Three speculative arms on an L4 produced three distinct digests
+      where every non-speculative arm agreed, so it is not lossless at temperature 0 and a
+      default-on would silently change what users get.
+    * It loads the draft head, which withholds the `nontext_bytes` subtraction and deepens
+      the expert offload — and host-memory accounting for this checkpoint is not yet
+      trustworthy: a glq-code session on a 120 GiB box held **102.8 GiB** of shared host
+      memory against a planned 65.3 GiB and was OOM-killed by the kernel. Until that is
+      understood, speculation does not get to raise the offload budget unasked.
+
+    Worth having behind the flag: with the expert arena it measured 19.692 tok/s on an L4
+    (3.060x a 6.436 baseline) and 37.957 on a 32 GiB Blackwell against 29.523 without. Which
+    N wins is hardware-dependent — 1 beat 3 on the L4, 3 beat 1 on the Blackwell — so neither
+    is a safe constant.
+
+    `head_is_quantized` is still reported by `checkpoint_mtp` and still worth knowing (a bf16
+    head costs the whole of `nontext_bytes` to load, two window tiers on a 24 GB card), but it
+    no longer selects a default now that there is none.
+
+    An explicit request on a checkpoint with no head is an error rather than a silent 0,
+    because the alternative is vLLM refusing the `--speculative-config` minutes into a weight
+    load — and because the user asked for something this checkpoint cannot do.
+    """
+    if requested is None:
+        return 0, None
+    n = int(requested)
+    if n < 0:
+        return 0, f"--mtp must be 0 or more, not {n}"
+    if n and not mtp_layers:
+        return 0, ("this checkpoint declares no MTP draft head, so --mtp cannot speculate "
+                   "with it. Re-run without --mtp, or pick a checkpoint whose name carries "
+                   "an mtp suffix.")
+    return n, None
 
 
 def sizing_weights_bytes(args, device=None):
@@ -377,6 +511,11 @@ def main(argv=None) -> int:
                         "number to pin it — vLLM would otherwise take the model's "
                         "declared maximum, which for gemma-4 is 262144 and needs GiB of "
                         "KV cache for a single request)")
+    p.add_argument("--mtp", type=int, default=None, metavar="N",
+                   help="speculate N draft tokens per step with the checkpoint's MTP draft "
+                        "head (default OFF). Which N wins is hardware-dependent: 1 beat 3 on "
+                        "an L4, 3 beat 1 on a 32 GiB Blackwell. Output is NOT byte-identical "
+                        "with speculation on, even at temperature 0.")
     p.add_argument("--max-num-seqs", type=int, default=None,
                    help=f"concurrent sequences vLLM plans for (default "
                         f"{DEFAULT_MAX_NUM_SEQS} on GPU, 4 on the CPU backend; vLLM's own "
@@ -435,6 +574,13 @@ def main(argv=None) -> int:
     # what actually lands in VRAM, and turns PLE offload on for a checkpoint that
     # cannot serve without it. (0, 0) for everything that declares nothing.
     _offload = checkpoint_offload_bytes(args.model)
+    # With the gradio guard above, and for the same reason: a `--speculative-config` this
+    # checkpoint cannot honour makes vLLM refuse minutes into a weight load.
+    _mtp_layers, _mtp_quantized, _decoder_layers = checkpoint_mtp(args.model)
+    _mtp, _mtp_err = resolve_mtp_tokens(args.mtp, _mtp_layers, _mtp_quantized)
+    if _mtp_err:
+        print(f"error: {_mtp_err}", file=sys.stderr)
+        return 2
     supervisor = VllmSupervisor(
         model=args.model,
         port=_server_port(args.base_url),
@@ -454,13 +600,30 @@ def main(argv=None) -> int:
         # the weights and the page cache inside one RAM budget.
         weights_bytes=sizing_weights_bytes(args),
         vram_bytes=None if args.gpu_memory_utilization is not None else _vram_bytes(),
+        # Host RAM, so the pinnable-expert cap can bind: offloaded weights are pinned and
+        # cannot be swapped, so an offload larger than the host fails to allocate.
+        ram_bytes=_ram_bytes(),
         # Declared host-offloadable bytes, so the supervisor sizes the pool and the window
         # from what actually lands in VRAM and turns PLE offload on for a checkpoint that
         # cannot serve without it. 0/0 for everything that declares nothing, which is every
         # checkpoint today except Qwen3.8-Flash-Next.
         ple_offload_bytes=_offload[0], expert_offload_bytes=_offload[1],
         nontext_bytes=_offload[2],
+        # Speculation changes the budget three ways, all handled in the supervisor: the MTP
+        # head is loaded (so `nontext_bytes` stops being subtracted), its own MoE layer
+        # becomes offloadable, and every decode step widens to `1 + mtp` tokens per stream.
+        mtp_tokens=_mtp, mtp_layers=_mtp_layers, decoder_layers=_decoder_layers,
         expert_offload_gib=args.cpu_offload_gb,
+        # One stream, because this command serves one person: it starts vLLM, opens a chat
+        # UI, and stops the server on the way out. Without this it inherited
+        # `_WINDOW_CONCURRENCY = 8` and had to afford its window eight times over, which is a
+        # server's requirement. Measured on a 22.49 GiB card with Flash-Next: 8192 at
+        # concurrency 8 against 65536 at 1, same offload, slightly larger arena.
+        #
+        # `max_num_seqs` deliberately stays at its default rather than following suit. Beyond
+        # the pool vLLM queues rather than failing, so a second browser tab waits instead of
+        # being refused — the over-subscription `_WINDOW_CONCURRENCY` documents.
+        window_concurrency=1,
     )
 
     # Ctrl-C already unwinds through the context manager below, but `kill` and a closed

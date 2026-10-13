@@ -25,6 +25,25 @@ jobs:
           pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install numpy
+          # safetensors and transformers are declared only in the `quantize` extra, which CI
+          # does not install -- datasets + accelerate + sentencepiece are too heavy for a CPU
+          # job. Both are needed anyway, and both are light on their own: safetensors is a
+          # ~1 MB wheel with no dependencies, transformers a 12.6 MB pure-python wheel that
+          # adds only regex and tokenizers here (huggingface_hub, pyyaml and filelock already
+          # arrive with `[hub]` below). No CUDA in either.
+          #
+          # Install them rather than guarding the tests, because the coverage is real:
+          # tests/test_resume_import.py writes actual checkpoint shards to exercise the
+          # resume-store rebuild, and TestTrellisMixedBpwGuard pins the refusal that stops a
+          # mixed-bpw trellis run writing a config whose per-layer `layer_bpw` the packing
+          # does not match.
+          #
+          # ORDER OF DISCOVERY, because it repeats: these files `importorskip` at module
+          # level, so a missing dependency makes the whole file SKIP rather than fail.
+          # Installing safetensors made 12 of them collect for the first time and they then
+          # failed on transformers -- a layer that had been invisible, not absent. Two tests
+          # still gate on `datasets`; expect the same unmasking if that is ever added.
+          pip install safetensors transformers
           # hub: jinja2 + huggingface_hub + pyyaml, the model-card feature's deps.
           # chat: gradio + openai. Not for the supervisor tests — those stub both, so they
           # run anywhere — but for tests/test_chat_ui.py, which is skipped without gradio
@@ -40,4 +59,9 @@ jobs:
           pip install pytest
 
       - name: Run tests
-        run: pytest tests/ -v
+        # -m "not slow" is the filter pyproject.toml's own marker definition asks
+        # for: "slow: marks tests that download models / take >30s (deselect with
+        # '-m \"not slow\"')". CI never applied it, so the end-to-end quantize test
+        # was pulling the wikitext train split and a 3B checkpoint over the network --
+        # in three parallel jobs -- in a CPU unit-test lane. Those run on the box.
+        run: pytest tests/ -v -m "not slow"

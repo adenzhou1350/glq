@@ -67,6 +67,12 @@ def _apply_activation(h, activation):
     return F.silu(h)
 
 
+#: Distinguishes "no arena was built for this layer" from "not yet decided". A plain None
+#: cannot: the first apply must be able to tell a recorded refusal from an unasked question,
+#: or every forward would retry the build.
+_ARENA_UNSET = object()
+
+
 class GLQFusedMoEMethod(FusedMoEMethodBase):
     """GLQ quantized FusedMoE method.
 
@@ -81,9 +87,14 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
     - w2_Qidxs, w2_SU, w2_SV, w2_Wscale: same pattern for down_proj
     """
 
-    def __init__(self, quant_config, moe=None):
+    def __init__(self, quant_config, moe=None, prefix: str | None = None):
         super().__init__(moe)
         self.quant_config = quant_config
+        # The layer's own name. `get_quant_method` has it; nothing downstream did, so a
+        # routing trace could not tell two layers apart — and a residency table keyed on a
+        # parsed index would collide decoder layer 0 with mtp.layers.0 (vLLM renumbers the
+        # draft block, the checkpoint does not). Optional so older callers still construct.
+        self.prefix = prefix
         # e8p MoE: register int64 TC-packed buffers + decode via the e8p path.
         # Loading is codebook-agnostic (vLLM's prefix expert-mapping carries the
         # `Qidxs_e8p` suffix; GLQ's shape-based _glq_weight_loader handles the
@@ -394,6 +405,133 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                 r2 = getattr(layer, f"{pfx}_trellis_packed2").shape[-1] // 16
                 ok = ok and 1 <= r2 <= 4
         layer.glq_trellis_fused_ok = bool(ok)
+        self._record_offload_facts(layer)
+        self._try_build_arena(layer)
+
+    @staticmethod
+    def _arena_report_every() -> int:
+        """Eager calls between hit-rate reports; 0 (default) is silent. Evidence that the
+        cache engaged, since a cache at a 0% hit rate still emits correct tokens."""
+        import os as _os
+        return int(_os.environ.get("GLQ_MOE_ARENA_REPORT_EVERY", "0"))
+
+    @staticmethod
+    def _arena_sources(layer) -> dict:
+        """The per-expert tensors the arena pages. One definition, used by both the
+        allocation and the later source binding, so the two cannot disagree about the set."""
+        names = [f"{p}_{s}" for p in ("w13", "w2")
+                 for s in ("trellis_packed", "trellis_packed2", "SU", "Wscale",
+                           "inv_resid_scale2")]
+        return {n: getattr(layer, n) for n in names if hasattr(layer, n)}
+
+    @staticmethod
+    def _record_offload_facts(layer) -> None:
+        """Note how much is offloaded, WHILE the vLLM config context is still active.
+
+        `get_current_vllm_config()` is backed by a context that model loading sets and a
+        forward does not. Called from `apply` it raises AssertionError, and vLLM's own message
+        names the case: *"a CustomOp was instantiated at module import time or model forward
+        time when config is not set"*. An earlier version read it at first apply, swallowed
+        that, and recorded 0.00 GiB offloaded against vLLM's own "Total CPU offloaded
+        parameters: 41.48" — so the arena declined on every layer and a whole A/B measured the
+        baseline twice.
+
+        Tensor introspection is not an alternative: a UVA view reports `is_cuda=True` with
+        host storage behind it, so is_cuda/is_pinned cannot distinguish it from a resident
+        tensor. The config is the only unambiguous source, and this is the only place it can
+        be read.
+        """
+        layer.glq_offload_gib = 0.0
+        layer.glq_offload_params = None
+        try:
+            from vllm.config import get_current_vllm_config
+            uva = getattr(getattr(get_current_vllm_config(), 'offload_config', None),
+                          'uva', None)
+            layer.glq_offload_gib = float(getattr(uva, 'cpu_offload_gb', 0) or 0)
+            layer.glq_offload_params = getattr(uva, 'cpu_offload_params', None)
+        except Exception:                             # noqa: BLE001 - read as no offload
+            pass
+
+    def _try_build_arena(self, layer):
+        """Arena for this layer, built on the FIRST apply and cached. Returns it or None.
+
+        ``_try_`` as in `inference_kernel._try_load_cuda_ext`: declining is an ordinary
+        outcome, never an error, and it must not block a forward.
+
+        **Built here rather than in `process_weights_after_loading`, for two measured
+        reasons.** vLLM's UVA offload runs *after* weight processing — at that point the
+        expert tensors are still on the device, so an offload check there reported 0.00 GiB
+        against vLLM's own "Total CPU offloaded parameters: 41.48" and the arena declined on
+        every layer. Worse, the tensor objects read then may be replaced by UVA views later,
+        so a `sources` dict captured at load time can hold tensors the op no longer uses.
+        Reading them at first apply gets their final form.
+
+        It also allocates in the right place: the first apply happens inside vLLM's memory
+        profiling forward, so the arena's footprint is counted before the KV pool is sized,
+        rather than competing with a pool that has already been fixed.
+        """
+        import os as _os
+
+        cached = getattr(layer, 'glq_arena', _ARENA_UNSET)
+        if cached is not _ARENA_UNSET:
+            # Allocated at load time. Bind the sources once, on the first forward, because
+            # vLLM's UVA offload runs after weight processing and replaces what the op reads.
+            if cached is not None and not getattr(layer, 'glq_arena_bound', False):
+                layer.glq_arena_bound = True
+                try:
+                    cached.rebind_sources(self._arena_sources(layer))
+                except Exception as e:                # noqa: BLE001
+                    layer.glq_arena = None
+                    print(f"glq[{self.prefix}]: expert arena disabled, source binding failed "
+                          f"({type(e).__name__}: {e})", flush=True)
+                    return None
+            return cached
+        layer.glq_arena = None               # a refusal is recorded, never retried
+
+        try:
+            from .expert_arena import ExpertArena, arena_decision_from_env
+        except Exception as e:                        # noqa: BLE001
+            print(f"glq: expert arena unavailable ({type(e).__name__}: {e})", flush=True)
+            return None
+
+        if not _os.environ.get("GLQ_MOE_EXPERT_CACHE", "").strip():
+            return None                      # off by default; stay silent on the hot path
+
+        sources = self._arena_sources(layer)
+        if not sources:
+            return None
+
+        # Recorded at load time by `_record_offload_facts`; the config context this comes
+        # from is not available here.
+        off_gib = float(getattr(layer, 'glq_offload_gib', 0.0) or 0.0)
+        off_params = getattr(layer, 'glq_offload_params', None)
+        experts_offloaded = (not off_params) or ('experts' in set(off_params))
+        offloaded = int(off_gib * 1024**3) if experts_offloaded else 0
+
+        n_moe = len(getattr(self.quant_config, '_moe_containers', ()) or ()) or 1
+        top_k = int(getattr(self.moe, 'experts_per_token', 0)
+                    or getattr(layer, 'top_k', 0) or 0)
+        if top_k <= 0:
+            print(f"glq[{self.prefix}]: expert arena needs top_k and the layer reports none, "
+                  f"so the simultaneity precondition cannot be checked; declining",
+                  flush=True)
+            return None
+
+        d = arena_decision_from_env(
+            _os.environ, n_layers=n_moe, n_experts=layer.glq_num_experts, top_k=top_k,
+            hidden_size=layer.glq_hidden_size, inter=layer.glq_intermediate_size,
+            w13_out=layer.glq_w13_out, bpw=layer.glq_bpw, offloaded_bytes=offloaded)
+        print(f"glq[{self.prefix}]: {d.reason}", flush=True)
+        if not d.enabled:
+            return None
+        try:
+            layer.glq_arena = ExpertArena(d, sources, n_experts=layer.glq_num_experts)
+            layer.glq_arena.warmup()        # compile Triton before cudagraph capture
+        except Exception as e:                        # noqa: BLE001
+            layer.glq_arena = None
+            print(f"glq[{self.prefix}]: expert arena not built ({type(e).__name__}: {e})",
+                  flush=True)
+        return layer.glq_arena
 
     def _apply_trellis(self, layer, x, topk_weights, topk_ids):
         """Trellis MoE **fallback**: per-expert loop reusing ``E8RHTLinear._trellis_linear_apply``
@@ -755,6 +893,14 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         GLQLinearMethod via the layer_bpw whitelist). ``**kwargs`` absorbs any
         further runner-only kwargs added by newer vLLM versions.
         """
+        # S0: record this forward's routing when asked. Inert by default — `active_trace`
+        # returns None unless GLQ_MOE_TRACE_ROUTING names a path — and it never touches the
+        # compute path, so a traced run and an untraced one produce identical tokens.
+        from .expert_trace import active_trace as _active_trace
+        _tr = _active_trace()
+        if _tr is not None:
+            _tr.record(self.prefix, topk_ids)
+
         if getattr(layer, 'glq_is_trellis', False):
             import os as _os
             from glq import inference_kernel as _ik
@@ -785,16 +931,34 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                 dtype = x.dtype
                 meta = layer._glq_trellis_moe_meta
                 m13, m2 = meta['w13'], meta['w2']
+                # Expert arena: fill any missing routing into a slot, then read the arena
+                # instead of the offloaded source. `ids` replaces topk_ids and `W` selects
+                # the weight tensors; everything else is unchanged, which is what keeps this
+                # bit-exact — the fused op's reduce is a fixed-order k loop, so substituting
+                # slots changes only WHERE a routing's weights are read from.
+                #
+                # Gated on token count (static, so each captured graph takes one branch) and
+                # on the simultaneity precondition already asserted at build time.
+                arena = self._try_build_arena(layer)
+                ids, W = topk_ids, layer
+                if arena is not None and x.shape[0] <= arena.decision.max_tokens:
+                    from .expert_arena import ArenaWeights as _ArenaWeights
+                    from .expert_arena import plan_step as _plan_step
+                    plan = _plan_step(arena.state, topk_ids)
+                    arena.fill(plan)
+                    ids = plan.slot_of.view(topk_ids.shape)
+                    W = _ArenaWeights(arena.buffers, layer)
+                    arena.maybe_report(self._arena_report_every())
                 output = torch.ops.glq.fused_moe_trellis_3inst(
                     x.half().contiguous(),
-                    topk_ids.to(torch.int64),
+                    ids.to(torch.int64),
                     topk_weights.float().contiguous(),
-                    layer.w13_trellis_packed, layer.w13_trellis_packed2,
-                    layer.w13_SU, layer.w13_SV, layer.w13_Wscale,
-                    layer.w13_inv_resid_scale2,
-                    layer.w2_trellis_packed, layer.w2_trellis_packed2,
-                    layer.w2_SU, layer.w2_SV, layer.w2_Wscale,
-                    layer.w2_inv_resid_scale2,
+                    W.w13_trellis_packed, W.w13_trellis_packed2,
+                    W.w13_SU, layer.w13_SV, W.w13_Wscale,
+                    W.w13_inv_resid_scale2,
+                    W.w2_trellis_packed, W.w2_trellis_packed2,
+                    W.w2_SU, layer.w2_SV, W.w2_Wscale,
+                    W.w2_inv_resid_scale2,
                     layer.glq_hidden_size, layer.glq_intermediate_size, layer.glq_w13_out,
                     m13['n_pad'], m13['m_pad'], m2['n_pad'], m2['m_pad'],
                     m13['_bn'], m13['_bm'], m13['_bnm'], m13['_bmm'],
