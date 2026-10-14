@@ -7,13 +7,28 @@
 # toolchain and the pip ordering by hand, and went stale: it shipped glq 0.5.3 / vLLM 0.20.2
 # against a current 0.8.x, and nothing here would have noticed.
 #
-# Base: CUDA *runtime*, not devel. install.sh installs nvcc and the CCCL headers from pip
-# into the venv, which is the path a user's machine takes, so a ~4 GB devel base buys
-# nothing but a second, divergent toolchain. Note the runtime image still ships
-# /usr/local/cuda (include/ + lib64/, no compiler) — torch's `_find_cuda_home()` resolves
-# that directory on sight, so glq checks for `bin/nvcc` before believing it. Plain
-# `ubuntu:24.04` also works and is what tests/test_installer_distros.py exercises; the CUDA
-# runtime base is kept because the eval tooling below links against it.
+# Base: plain Ubuntu, NOT an nvidia/cuda image. install.sh installs nvcc and the CCCL headers
+# from pip into the venv (`cuda-toolkit[nvcc,cccl]` → `<site-packages>/nvidia/cu13/bin/nvcc`),
+# which is the path a user's machine takes, so the CUDA runtime and the compiler both arrive
+# as wheels. At `docker run --gpus all` the NVIDIA Container Toolkit injects the *driver*
+# (libcuda.so); the CUDA *runtime* (libcudart) comes from pip. Nothing here needs a system CUDA.
+#
+# This used to be `nvidia/cuda:12.9.1-runtime-ubuntu24.04`, and that pin broke the image for
+# **six consecutive releases** (v0.8.6 through v0.8.26, measured) with the build failing at the
+# kernel-assertion step below:
+#
+#   prebuilt glq._C did not load: ImportError: libcudart.so.13: cannot open shared object file
+#   OSError: CUDA_HOME environment variable is not set.
+#
+# The wheels link against CUDA **13** while the base supplied libcudart.so.**12**, so the
+# prebuilt extension could not load and the JIT fallback had no compiler to fall back to. Two
+# separately-pinned CUDA versions is the defect; a plain base removes the class rather than
+# re-pinning it, and `tests/test_installer_distros.py` already exercises `ubuntu:24.04`.
+#
+# 24.04 rather than 26.04 deliberately: nvcc caps the host gcc version, install.sh carries
+# per-distro compat-compiler logic for that (`MAX_NVCC_GCC`), and 24.04's gcc 13 sits under
+# CUDA 13's ceiling without needing it. Fedora 44 is blocked outright by gcc 16 vs CUDA 13 —
+# see the distro-matrix notes. Move to 26.04 once the matrix has a green source-mode run on it.
 #
 # Build:   docker build -t ghcr.io/cnygaard/glq-env:0.8.27 .
 #          docker build --build-arg GLQ_VERSION=0.8.27 .
@@ -21,10 +36,9 @@
 #              -v $HOME/.cache/huggingface:/cache/hf \
 #              -e HF_TOKEN=$HF_TOKEN \
 #              ghcr.io/cnygaard/glq-env:0.8.27
-ARG CUDA_VERSION=12.9.1
 ARG UBUNTU_VERSION=24.04
 
-FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
+FROM ubuntu:${UBUNTU_VERSION}
 
 # Which glq to install. Everything else — torch, vLLM, transformers, the CUDA build
 # toolchain — is resolved by the installer, so there is exactly one pin to bump here.
@@ -86,8 +100,37 @@ COPY --chown=glq:glq install.sh /tmp/install.sh
 # No --mount=type=cache here: BuildKit's cache mounts are root-owned by default, and the
 # uid=/gid= options do not take build args, so the one thing that would make them writable
 # by this user cannot be expressed. Layer caching still covers the common rebuild.
-RUN bash /tmp/install.sh --yes \
-        --components core,vllm \
+# `picode` adds the pi coding agent, and node via nvm into /home/glq/.nvm, so `glq-code`
+# runs in the container instead of exiting on a missing agent. It works here without nvm
+# being sourced: `glq-code._find_pi()` globs `~/.nvm/versions/node/*/bin/pi` rather than
+# trusting PATH, deliberately, because a bare `which pi` can resolve the unrelated
+# Raspberry-Pi `pi` from apt. `chat` adds gradio for `glq-chat`.
+#
+# Both components were verified non-interactively under `--yes` on a fresh Ubuntu 24.04 box:
+# pi landed at ~/.nvm/versions/node/v24.21.0/bin/pi and `glq-setup --verify` reported 7/7.
+# `--device cuda` is REQUIRED and is the whole reason this build used to fail. `docker build`
+# has no GPU, so install.sh's auto-detection is correct about what it can see and installs the
+# CPU stack — measured in a failing build:
+#
+#   gpu:  no NVIDIA GPU detected — GLQ will serve on CPU (vLLM CPU backend)
+#   == no NVIDIA GPU — skipping the CUDA build toolchain
+#   [ ok ] vllm backend: vLLM 0.29.0+cpu — the CPU backend     (and torch-2.13.0+cpu)
+#
+# The image then asserted the CUDA extension below and could never pass: a +cpu torch ships
+# no libcudart at any version, and the skipped toolchain left `_venv_cuda_home()` empty, so
+# the JIT fallback died on `CUDA_HOME environment variable is not set`. The image is built on
+# a GPU-less runner but RUN with `--gpus all`, so the build has to state the target rather
+# than probe for it.
+#
+# GLQ_ASSUME_GPU=1 is needed alongside it. `--device cuda` is passed through to
+# `python -m glq.installer` and picks the CUDA vLLM/torch wheels, but install.sh's OWN
+# toolchain gate probes `nvidia-smi` independently and would still skip nvcc + the CCCL
+# headers, leaving CUDA torch with no compiler and `_venv_cuda_home()` empty. That variable
+# is documented in install.sh as the hook for asserting the GPU branch on a machine without
+# one, which is precisely a Docker build.
+RUN GLQ_ASSUME_GPU=1 bash /tmp/install.sh --yes \
+        --components core,vllm,chat,picode \
+        --device cuda \
         --glq-version "${GLQ_VERSION}"
 
 # Bake the fused CUDA kernels for every architecture we support, so the first request in a
@@ -98,7 +141,24 @@ ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;12.0+PTX"
 # Assert, do not swallow. This used to end in `|| true`, which meant an image could ship
 # with no kernels at all and say nothing — the same silent-downgrade failure the runtime
 # diagnostics exist to prevent. `cuda_ext_status()` returns the compiler's own words.
-RUN python -c "\
+#
+# CUDA_HOME and the venv's lib dir are set here because there is no GPU during the build:
+# torch only preloads its bundled nvidia libs when a device is present, so without this the
+# prebuilt `_C` cannot resolve `libcudart.so.13` even though the wheel ships it at
+# `<site-packages>/nvidia/cu13/lib/`. With the path set the PREBUILT extension loads, which
+# is faster than a JIT build and a stricter check — it validates the wheel that ships rather
+# than one compiled here. `CUDA_HOME` is the JIT fallback's requirement; the compiler lives
+# in site-packages, not /usr/local/cuda, so torch cannot find it unaided.
+#
+# `echo` the value deliberately: when this was first attempted it printed `CUDA_HOME=` empty,
+# which is what revealed that the real fault was further up — install.sh had taken the CPU
+# path and never installed the toolchain at all. A blank here means `--device cuda` above did
+# not take effect.
+RUN export CUDA_HOME="$(python -c 'import glq.inference_kernel as ik; print(ik._venv_cuda_home() or "")')" && \
+    export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${LD_LIBRARY_PATH:-}" && \
+    echo "CUDA_HOME=${CUDA_HOME}" && \
+    test -n "${CUDA_HOME}" && \
+    python -c "\
 import sys; import glq.inference_kernel as ik; \
 ok, err = ik.cuda_ext_status(); \
 print('glq CUDA ext:', ik._glq_cuda.__file__ if ok else 'FAILED'); \
